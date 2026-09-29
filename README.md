@@ -47,12 +47,17 @@ the tree (its `CITATION.cff` records what was kept). One static exe, nothing els
 ## Usage
 
 ```
-av1mkv encode <in.cfhd> <out.webm> [--cq 22] [--gop 60] [--gpu "RTX 4090"] [--frames N]
+av1mkv encode <in.cfhd> <out.webm> [--cq 22] [--gop 60] [--gpu "RTX 4090"] [--frames N] [--xmp packet.xml]
 av1mkv info <file.webm>
 av1mkv dump-frame <in.cfhd> <index> <out.ppm>
 ```
 
 Any other output extension is refused.
+
+`--xmp` puts an XMP packet (the file's whole `<?xpacket begin ... end?>` text) into the
+segment as a `Tags/Tag/SimpleTag` named `XMP`, so the file carries its own description.
+`info` lists every tag and says whether an `XMP` one is a whole packet; a file with none
+prints `tags: none`.
 
 ## Encoder settings (recorded)
 

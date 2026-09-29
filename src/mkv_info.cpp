@@ -9,6 +9,7 @@
 #include <mkvparser/mkvreader.h>
 
 #include <cstdio>
+#include <cstring>
 #include <map>
 
 int mkv_info(const char* path)
@@ -78,6 +79,23 @@ int mkv_info(const char* path)
         std::printf("track %lld: %lld blocks, %lld key, %lld bytes, first %.3f s, last %.3f s\n", kv.first, kv.second, keys[kv.first],
                     bytes[kv.first], double(first_ns[kv.first]) / 1e9, double(last_ns[kv.first]) / 1e9);
     }
+    // Every SimpleTag; an XMP one is checked for a whole packet, and "no tags" is said, not skipped.
+    const mkvparser::Tags* tags = segment->GetTags();
+    int simple = 0;
+    for (int i = 0; tags && i < tags->GetTagCount(); i++) {
+        const mkvparser::Tags::Tag* t = tags->GetTag(i);
+        for (int k = 0; t && k < t->GetSimpleTagCount(); k++) {
+            const mkvparser::Tags::SimpleTag* st = t->GetSimpleTag(k);
+            const char* name = st->GetTagName() ? st->GetTagName() : "";
+            const char* value = st->GetTagString() ? st->GetTagString() : "";
+            simple++;
+            std::printf("tag %s: %zu bytes", name, std::strlen(value));
+            if (!std::strcmp(name, "XMP"))
+                std::printf(", %s", std::strstr(value, "<?xpacket begin") && std::strstr(value, "<?xpacket end") ? "a whole xpacket" : "NOT an xpacket");
+            std::printf("\n");
+        }
+    }
+    if (simple == 0) std::printf("tags: none\n");
     const mkvparser::Cues* cues = segment->GetCues();
     if (cues) {
         while (cues->LoadCuePoint()) {}

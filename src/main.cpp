@@ -3,7 +3,7 @@
 // av1mkv: a CineForm (CFHD in AVI, as entities-godot-cineform's MovieWriter writes it) to
 // AV1-and-FLAC .webm transcoder, and an mkvparser-based inspector for the result.
 //
-//   av1mkv encode <in.cfhd> <out.webm> [--cq 22] [--gop 60] [--gpu "RTX 4090"] [--frames N]
+//   av1mkv encode <in.cfhd> <out.webm> [--cq 22] [--gop 60] [--gpu "RTX 4090"] [--frames N] [--xmp packet.xml]
 //   av1mkv info <file.webm>
 //   av1mkv dump-frame <in.cfhd> <index> <out.ppm>
 //
@@ -26,6 +26,8 @@
 #include <mkvmuxer/mkvwriter.h>
 
 #include <chrono>
+#include <fstream>
+#include <sstream>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -91,6 +93,20 @@ void flip_rows(const std::vector<uint8_t>& src, int32_t pitch, int height, std::
         std::memcpy(dst.data() + size_t(pitch) * y, src.data() + size_t(pitch) * (height - 1 - y), size_t(pitch));
 }
 
+// An XMP packet file for the segment's XMP SimpleTag: the whole <?xpacket begin ... end?> text.
+std::string read_xmp(const char* path, std::string& xmp)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return std::string("cannot read ") + path;
+    std::stringstream ss;
+    ss << f.rdbuf();
+    xmp = ss.str();
+    if (xmp.find("<?xpacket begin") == std::string::npos || xmp.find("<?xpacket end") == std::string::npos)
+        return std::string(path) + " is not an XMP packet (no <?xpacket begin ... end?>)";
+    if (xmp.find('\0') != std::string::npos) return std::string(path) + " has a NUL byte";
+    return std::string();
+}
+
 int dump_frame(const char* in, size_t index, const char* out)
 {
     AviMovie m;
@@ -119,16 +135,21 @@ int dump_frame(const char* in, size_t index, const char* out)
 
 int encode(int argc, char** argv)
 {
-    if (argc < 4) return fail("usage: av1mkv encode <in.cfhd> <out.webm> [--cq N] [--gop N] [--gpu NAME] [--frames N]");
+    if (argc < 4) return fail("usage: av1mkv encode <in.cfhd> <out.webm> [--cq N] [--gop N] [--gpu NAME] [--frames N] [--xmp FILE]");
     const char* in = argv[2];
     const char* out = argv[3];
     NvencAv1Settings s;
     size_t max_frames = 0;
+    std::string xmp;
     for (int i = 4; i + 1 < argc; i += 2) {
         if (!std::strcmp(argv[i], "--cq")) s.cq = uint32_t(std::atoi(argv[i + 1]));
         else if (!std::strcmp(argv[i], "--gop")) s.gop = uint32_t(std::atoi(argv[i + 1]));
         else if (!std::strcmp(argv[i], "--gpu")) s.adapter_name_contains = argv[i + 1];
         else if (!std::strcmp(argv[i], "--frames")) max_frames = size_t(std::atoll(argv[i + 1]));
+        else if (!std::strcmp(argv[i], "--xmp")) {
+            const std::string e = read_xmp(argv[i + 1], xmp);
+            if (!e.empty()) return fail(e);
+        }
         else return fail(std::string("unknown option ") + argv[i]);
     }
 
@@ -177,6 +198,12 @@ int encode(int argc, char** argv)
     // Default duration of one frame in ns, so a player knows the frame period.
     video->set_default_duration(uint64_t(1000000000ull * m.fps_den / m.fps_num));
     seg.CuesTrack(vtrack);
+    // Tags go into the segment header, which the first AddFrame writes.
+    if (!xmp.empty()) {
+        mkvmuxer::Tag* tag = seg.AddTag();
+        if (!tag || !tag->add_simple_tag("XMP", xmp.c_str())) return fail("cannot add the XMP tag");
+        std::printf("xmp: %zu bytes as the segment's XMP SimpleTag\n", xmp.size());
+    }
     uint64_t atrack = 0;
     // A .webm carries the PCM losslessly as FLAC (libFLAC). WebM's spec names only Opus and Vorbis,
     // so libwebm writes the matroska doctype for it; browser players decode FLAC in Matroska.
@@ -302,7 +329,7 @@ int main(int argc, char** argv)
     if (argc >= 3 && !std::strcmp(argv[1], "info")) return mkv_info(argv[2]);
     if (argc >= 5 && !std::strcmp(argv[1], "dump-frame")) return dump_frame(argv[2], size_t(std::atoll(argv[3])), argv[4]);
     std::fprintf(stderr,
-                 "usage:\n  av1mkv encode <in.cfhd> <out.webm> [--cq N] [--gop N] [--gpu NAME] [--frames N]\n"
+                 "usage:\n  av1mkv encode <in.cfhd> <out.webm> [--cq N] [--gop N] [--gpu NAME] [--frames N] [--xmp FILE]\n"
                  "  av1mkv info <file.webm>\n  av1mkv dump-frame <in.cfhd> <index> <out.ppm>\n");
     return 2;
 }
