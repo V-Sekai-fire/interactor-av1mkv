@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: If you use this code, cite the libwebm fork it is vendored from.
+title: libwebm (vendored)
+abstract: >-
+  The WebM project's Matroska/WebM muxer and parser (mkvmuxer, mkvparser), added
+  here as a squashed git subtree of the V-Sekai-fire fork at commit 6184f44 (main).
+  tools/av1mkv compiles mkvmuxer/mkvmuxer.cc, mkvmuxerutil.cc, mkvwriter.cc,
+  mkvparser/mkvparser.cc and mkvreader.cc straight into its executable (its own CMake is
+  not used) to write V_AV1 plus A_PCM/INT/LIT Matroska and to read it back for
+  verification. No source is modified.
+type: software
+authors:
+  - name: The WebM Project Authors
+  - name: V-Sekai
+repository-code: https://github.com/V-Sekai-fire/libwebm
+commit: 6184f4484a826724b5293837134ab9492261b941
+license: BSD-3-Clause

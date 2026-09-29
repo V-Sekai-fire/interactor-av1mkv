@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: libFLAC, vendored in tools/av1mkv (the library only).
+title: FLAC (libFLAC)
+abstract: >-
+  libFLAC from V-Sekai-fire/flac at tag 1.5.0 (1507800de4b70e21be71f38caa0d9079d0bc6e45),
+  a fork of xiph/flac, stripped to the BSD-licensed library: include/FLAC, the share
+  headers libFLAC includes, src/libFLAC and src/share/win_utf8_io, with the CMake files
+  trimmed to build it alone. The flac and metaflac programs, the tests, libFLAC++ and the
+  GPL and LGPL share/ helpers are not in this tree.
+authors:
+  - name: Xiph.Org Foundation
+repository-code: https://github.com/V-Sekai-fire/flac
+commit: 1507800de4b70e21be71f38caa0d9079d0bc6e45
+license: BSD-3-Clause

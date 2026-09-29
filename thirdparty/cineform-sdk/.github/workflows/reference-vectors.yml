@@ -1,0 +1,141 @@
+# Does the NEON path produce the same bitstream as the SSE2/MMX path it replaces?
+#
+# This cannot be answered on one machine. A Mac runs an x86 build under Rosetta, which
+# does its own SSE-to-NEON translation, so a local A/B compares one translation against
+# another and neither side is native. Two runners settle it: ubuntu-latest is real x86_64,
+# macos-latest is real Apple Silicon.
+#
+# TestCFHD -d is the vector source because it is deterministic by construction: QBIST with
+# a fixed seed (Example/TestCFHD.cpp, QBIST_SEED 50), so the same input reaches the encoder
+# on both machines without shipping a fixture.
+#
+# WHAT FAILS THIS JOB. A PSNR divergence beyond the tolerance, which would mean a shim is
+# wrong. Differing byte counts do NOT fail it: the shim is a port rather than a bit-exact
+# reimplementation, and whether the bitstreams match is a fact worth recording rather than
+# a rule worth enforcing. The summary says which happened.
+name: reference-vectors
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  vectors:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The comparison that matters: same OS, same toolchain, different ISA.
+          # ubuntu-latest against macos-latest changed the operating system and the
+          # compiler at the same time as the architecture, so a difference could not
+          # be attributed to any one of them.
+          - os: ubuntu-latest
+            arch: x86_64
+            label: linux-x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+            label: linux-arm64
+          # macOS arm64 stays as a third point, compared against linux-arm64 to show
+          # what the platform contributes on its own.
+          # Same OS and ISA as linux-arm64, different compiler. linux-arm64 builds with
+          # the Ubuntu default (gcc) and macos-arm64 with clang, so the platform
+          # comparison was really OS *and* compiler at once -- the same conflation that
+          # made the first version of this workflow blame the ISA. This isolates the
+          # compiler.
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+            label: linux-arm64-clang
+            cc: clang
+            cxx: clang++
+          - os: macos-latest
+            arch: arm64
+            label: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # EncoderSDK/StdAfx.h includes <uuid/uuid.h> on every non-Windows target and the
+      # CMakeLists links -luuid under UNIX. uuid_generate is in libSystem on macOS, so
+      # nothing is installed there.
+      - name: Install libuuid
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y uuid-dev
+
+      - name: Confirm the runner is the architecture we think it is
+        run: |
+          set -eux
+          uname -m
+          test "$(uname -m)" = "${{ matrix.arch }}" || {
+            echo "runner is $(uname -m), matrix says ${{ matrix.arch }}"; exit 1; }
+
+      - name: Install clang
+        if: matrix.cc == 'clang'
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Build TestCFHD
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DBUILD_TOOLS=ON
+          cmake --build build --parallel
+
+      # Pin the decoder's thread count. Unpinned it is min(cores, 16), and the runners
+      # do not agree on cores -- so the three machines were running three different
+      # thread counts and their output was never comparable. It also made the test
+      # disagree with itself: unpinned, two runs on one machine differ on ~15 of 400
+      # frames by more than 0.2 dB; pinned, they are identical on all 400 including PSNR.
+      - name: Run the vectors
+        env:
+          CFHD_TEST_MAXCPUS: '1'
+        run: ./build/TestCFHD -d | tee vectors-${{ matrix.label }}.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vectors-${{ matrix.label }}
+          path: vectors-${{ matrix.label }}.txt
+
+  compare:
+    needs: vectors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: 'vectors-*', merge-multiple: true }
+      # set -o pipefail, or `| tee` swallows the script's exit status and a failing
+      # comparison reports success. That happened on the first run of this workflow.
+      - name: ISA — linux x86_64 vs linux arm64
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 scripts/compare_vectors.py \
+            vectors-linux-x86_64.txt vectors-linux-arm64.txt linux-x86_64 linux-arm64 \
+            | tee compare.txt
+      - name: Compiler — linux arm64 gcc vs linux arm64 clang (same OS and ISA, informational)
+        if: always()
+        shell: bash
+        continue-on-error: true
+        run: |
+          python3 scripts/compare_vectors.py \
+            vectors-linux-arm64.txt vectors-linux-arm64-clang.txt linux-gcc linux-clang \
+            | tee compiler.txt || true
+      - name: Platform — linux arm64 vs macos arm64 (same ISA, informational)
+        if: always()
+        shell: bash
+        continue-on-error: true
+        run: |
+          python3 scripts/compare_vectors.py \
+            vectors-linux-arm64.txt vectors-macos-arm64.txt linux-arm64 macos-arm64 \
+            | tee platform.txt || true
+      - name: Summary
+        if: always()
+        run: |
+          { echo '## ISA: linux x86_64 vs linux arm64'; echo; echo '```';
+            cat compare.txt; echo '```'; echo;
+            echo '## Compiler: gcc vs clang, both linux arm64'; echo; echo '```';
+            cat compiler.txt 2>/dev/null || echo '(not produced)'; echo '```'; echo;
+            echo '## Platform: linux arm64 vs macos arm64 (same ISA)'; echo; echo '```';
+            cat platform.txt 2>/dev/null || echo '(not produced)'; echo '```';
+          } >> "$GITHUB_STEP_SUMMARY"

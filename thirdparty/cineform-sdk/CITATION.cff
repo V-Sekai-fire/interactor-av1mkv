@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: If you use this code, cite the CineForm SDK fork it is vendored from.
+title: CineForm SDK (vendored)
+abstract: >-
+  GoPro's CineForm codec SDK (CFHD wavelet encoder and decoder), added here as a squashed
+  git subtree of the V-Sekai-fire fork at commit 9c2973f (master, the same commit
+  entities-godot-cineform builds). tools/av1mkv builds CFHDCodecStatic from it with its
+  own CMakeLists (BUILD_TOOLS off, OpenMP off, -Wno-incompatible-pointer-types and
+  -Wno-incompatible-function-pointer-types as entities-godot-cineform does under clang)
+  and uses CFHD_OpenDecoder / CFHD_PrepareToDecode / CFHD_DecodeSample to decode the
+  MovieWriter's 12-bit RGB 4:4:4 samples to 8-bit BGRA. No source is modified.
+type: software
+authors:
+  - name: GoPro, Inc.
+  - name: V-Sekai
+repository-code: https://github.com/V-Sekai-fire/cineform-sdk
+commit: 9c2973f3b66ab20dcef3bd7b05f84be23fa8a080
+license: Apache-2.0 OR MIT
