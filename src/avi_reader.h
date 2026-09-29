@@ -25,6 +25,8 @@ struct AviMovie {
     uint32_t fps_num = 0, fps_den = 1;   // vids strh dwRate/dwScale
     uint32_t total_frames = 0;            // avih dwTotalFrames
     char handler[5] = {0, 0, 0, 0, 0};
+    uint64_t riff_size = 0;
+    std::vector<uint8_t> video_format; // the vids strf, a BITMAPINFOHEADER
     // audio
     bool has_audio = false;
     uint32_t mix_rate = 0, channels = 0, bits = 0;
@@ -59,7 +61,8 @@ inline std::string avi_read(const char* path, AviMovie& m)
 
     // Walk the top-level chunks; descend into LIST hdrl (strl lists) and LIST movi.
     uint64_t pos = 12;
-    const uint64_t riff_end = std::min<uint64_t>(n, 8 + u32(b + 4));
+    m.riff_size = u32(b + 4);
+    const uint64_t riff_end = std::min<uint64_t>(n, 8 + m.riff_size);
     int stream_index = 0;
     while (pos + 8 <= riff_end) {
         const uint8_t* c = b + pos;
@@ -102,6 +105,7 @@ inline std::string avi_read(const char* path, AviMovie& m)
                                     m.mix_rate = u32(s + 8 + 4);
                                     m.bits = u16(s + 8 + 14);
                                 } else if (tag((const uint8_t*)type, "vids") && ss >= 40) {
+                                    m.video_format.assign(s + 8, s + 8 + ss);
                                     if (!m.width) m.width = u32(s + 8 + 4);
                                     if (!m.height) m.height = u32(s + 8 + 8);
                                 }
@@ -136,5 +140,18 @@ inline std::string avi_read(const char* path, AviMovie& m)
     if (m.video.empty()) return "no 00dc video chunks";
     if (!m.width || !m.height) return "no dimensions in the headers";
     if (!m.fps_num) { m.fps_num = 30; m.fps_den = 1; }
+    return std::string();
+}
+
+// A file the writer finished: every byte its RIFF header counts is present, and the movi list
+// holds as many video chunks as the avih header says were written.
+inline std::string avi_complete(const AviMovie& m)
+{
+    if (8 + m.riff_size > m.bytes.size())
+        return "truncated: the RIFF header counts " + std::to_string(8 + m.riff_size) + " bytes, the file has " +
+               std::to_string(m.bytes.size());
+    if (m.video.size() != m.total_frames)
+        return "truncated: the header says " + std::to_string(m.total_frames) + " frames, the movi list has " +
+               std::to_string(m.video.size());
     return std::string();
 }

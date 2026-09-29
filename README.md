@@ -1,10 +1,12 @@
-# av1mkv: CineForm recording to AV1 and FLAC in a .webm
+# av1mkv: CineForm recording to AV1 and FLAC in a .webm, or to CineForm and FLAC in a .mkv
 
 Turns the `.cfhd` files entities-godot-cineform's MovieWriter writes (CFHD 12-bit RGB
 4:4:4 in an AVI/RIFF container, with a 16-bit PCM track) into a `.webm` of AV1 video and
 FLAC audio, which chat clients and browsers play inline. No FFmpeg anywhere, no HEVC, no
 H.264: the decoder is the org's CineForm SDK, the video encoder NVENC AV1 through the
-NVIDIA driver, the audio encoder libFLAC, the muxer the org's libwebm.
+NVIDIA driver, the audio encoder libFLAC, the muxer the org's libwebm. `av1mkv mkv` keeps
+the picture lossless instead: the same CFHD frames, byte for byte, in a Matroska `.mkv`, with
+the audio as FLAC.
 
 - `src/avi_reader.h`: walks the RIFF the writer emits (`LIST hdrl` with `avih`, a `vids`
   CFHD `strl`, an `auds` PCM `strl`; `LIST movi` of `00dc`/`01wb` chunks; `idx1` unused).
@@ -28,6 +30,8 @@ NVIDIA driver, the audio encoder libFLAC, the muxer the org's libwebm.
   blocks, sequence headers stay on every key frame.
 - `src/mkv_info.cpp`: `av1mkv info`, the verification: reads the file back with
   libwebm's mkvparser.
+- `src/mkv_tracks.cpp`: reads a `.mkv` back for `av1mkv check` and `dump-frame`. It refuses a
+  file whose segment runs past its end; mkvparser alone reads that as a segment of unknown size.
 
 ## Build
 
@@ -48,11 +52,31 @@ the tree (its `CITATION.cff` records what was kept). One static exe, nothing els
 
 ```
 av1mkv encode <in.cfhd> <out.webm> [--cq 22] [--gop 60] [--gpu "RTX 4090"] [--frames N] [--xmp packet.xml]
-av1mkv info <file.webm>
-av1mkv dump-frame <in.cfhd> <index> <out.ppm>
+av1mkv mkv <in.cfhd> <out.mkv>
+av1mkv check <in.cfhd> <in.mkv>
+av1mkv info <file.webm|file.mkv>
+av1mkv dump-frame <in.cfhd|in.mkv> <index> <out.ppm>
 ```
 
-Any other output extension is refused.
+`encode` writes only a `.webm` and `mkv` only a `.mkv`; any other output extension is refused.
+
+## The .mkv (CineForm and FLAC)
+
+The video track uses the Matroska codec specification's `V_MS/VFW/FOURCC` mapping: the
+CodecPrivate is a BITMAPINFOHEADER, and a block is one frame as the AVI stored it. The
+BITMAPINFOHEADER is the recording's own `vids` `strf`, copied unchanged (40 bytes, 24-bit,
+FOURCC `CFHD`). Every CFHD frame is intra, so every block is a key frame; libwebm starts a
+cluster and a cue point at each one. The Duration is the frame count over the frame rate.
+The audio is the same libFLAC track `encode` writes. The doctype is `matroska`.
+
+`mkv` refuses a recording the writer did not finish: the RIFF header must count no more bytes
+than the file has, and the `movi` list must hold the frame count `avih` states. After it
+writes the file, `mkv` runs `check`, which reads the `.mkv` back with mkvparser and requires:
+
+- the CodecPrivate equals the recording's BITMAPINFOHEADER;
+- every video block equals its `00dc` chunk byte for byte, and each is a key frame;
+- libFLAC decodes the FLAC blocks to the recording's PCM, every sample and the MD5;
+- the Duration is within 1 ms of the frame count over the frame rate.
 
 `--xmp` puts an XMP packet (the file's whole `<?xpacket begin ... end?>` text) into the
 segment as a `Tags/Tag/SimpleTag` named `XMP`, so the file carries its own description.
@@ -92,3 +116,25 @@ Per frame: CFHD decode 2.49 ms, row flip 0.30 ms, copy into the NVENC input buff
 - The FLAC track decodes back bit-exact through libFLAC, MD5 checked, before it is muxed.
 - A chat client played the sit and walk clips inline, picture and all, when uploaded.
 - A `.mkv` output is refused: "the output must be a .webm (AV1 video, the audio as FLAC)".
+
+### The .mkv (2026-09-29, the first rung's pen and wear clip on Mire)
+
+`wear_mire.cfhd`, 15,823,630 bytes, 1152x648, 30 fps, 97 frames, recorded by Gate 8
+(`--gate=pen --pen=scripted`) on the stock single-precision engine. `av1mkv mkv` wrote
+`wear_mire.mkv`, 15,203,118 bytes (96.08% of the input: 620,800 bytes of silent PCM became
+534 bytes of FLAC),
+in 0.04 s.
+
+- `check`: 97 of 97 video blocks equal the `.cfhd`'s chunks, 97 key; the 38 FLAC blocks
+  decode to the 155,200 PCM samples x2; Duration 3.233 s.
+- `info`: track 1 `V_MS/VFW/FOURCC` 1152x648, BITMAPINFOHEADER FOURCC `CFHD` 24-bit; track 2
+  `A_FLAC` 48000 Hz 2 ch; 97 clusters, 97 cue points.
+- `dump-frame` of frames 48 and 96 from the `.mkv` and from the `.cfhd` gives the same PPM
+  byte for byte. Control: frame 48 of the `.mkv` against frame 96 of the `.cfhd` differs
+  (69,164 of 746,496 pixels).
+- Controls, each refused: the `.cfhd` cut to 9,500,000 bytes ("truncated: the RIFF header
+  counts 15823630 bytes, the file has 9500000"); the `.mkv` cut to 9,100,000 bytes, in
+  `info`, `check` and `dump-frame` ("truncated: the segment ends at byte 15203118, the file
+  has 9100000"); one byte of video block 50 changed ("a video frame differs", 96 of 97
+  equal); one byte of FLAC block 10 changed ("libFLAC could not decode the track"); a
+  `.webm` output name for `mkv`.
