@@ -1,22 +1,27 @@
 // SPDX-License-Identifier: MIT
 //
 // av1mkv: a CineForm (CFHD in AVI, as entities-godot-cineform's MovieWriter writes it) to
-// AV1-and-FLAC .webm transcoder, and an mkvparser-based inspector for the result.
+// AV1-and-FLAC .webm transcoder, a CineForm-and-FLAC .mkv remuxer, and an mkvparser-based
+// inspector for both.
 //
 //   av1mkv encode <in.cfhd> <out.webm> [--cq 22] [--gop 60] [--gpu "RTX 4090"] [--frames N] [--xmp packet.xml]
-//   av1mkv info <file.webm>
-//   av1mkv dump-frame <in.cfhd> <index> <out.ppm>
+//   av1mkv mkv <in.cfhd> <out.mkv> [--xmp packet.xml]
+//   av1mkv check <in.cfhd> <in.mkv>
+//   av1mkv info <file.webm|file.mkv>
+//   av1mkv dump-frame <in.cfhd|in.mkv> <index> <out.ppm>
 //
 // Decode: V-Sekai-fire/cineform-sdk, CFHD_OpenDecoder / CFHD_PrepareToDecode /
 // CFHD_DecodeSample to 8-bit BGRA (the 12-bit 4:4:4 source is rounded to 8 bits here; the
 // encoder is 8-bit 4:2:0). Encode: NVENC AV1 through the NVIDIA driver (nvenc_av1.cpp).
 // Mux: V-Sekai-fire/libwebm mkvmuxer, V_AV1 with an av1C CodecPrivate built from the
 // sequence header OBU of the first key frame (av1c.h), plus the recording's PCM track as
-// A_FLAC (libFLAC, flac_track.cpp). No FFmpeg anywhere.
+// A_FLAC (libFLAC, flac_track.cpp). The .mkv carries the CFHD frames unchanged as
+// V_MS/VFW/FOURCC, the recording's BITMAPINFOHEADER as its CodecPrivate. No FFmpeg anywhere.
 
 #include "avi_reader.h"
 #include "av1c.h"
 #include "flac_track.h"
+#include "mkv_tracks.h"
 #include "nvenc_av1.h"
 
 #include <CFHDDecoder.h>
@@ -26,6 +31,7 @@
 #include <mkvmuxer/mkvwriter.h>
 
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <sstream>
 #include <cstdio>
@@ -54,15 +60,15 @@ struct CfhdDecoder {
     int32_t pitch = 0;
     std::vector<uint8_t> frame;
 
-    std::string open(const AviMovie& m)
+    std::string open(const AviMovie& m) { return open(int(m.width), int(m.height), m.data(m.video[0]), m.video[0].size); }
+    std::string open(int w, int h, const uint8_t* first, uint32_t first_size)
     {
         CFHD_Error err = CFHD_OpenDecoder(&ref, nullptr);
         if (err != CFHD_ERROR_OKAY) return "CFHD_OpenDecoder failed, code " + std::to_string(int(err));
-        const AviChunk& first = m.video[0];
         int aw = 0, ah = 0;
         CFHD_PixelFormat af = format;
-        err = CFHD_PrepareToDecode(ref, int(m.width), int(m.height), format, CFHD_DECODED_RESOLUTION_FULL, CFHD_DECODING_FLAGS_NONE,
-                                   const_cast<uint8_t*>(m.data(first)), first.size, &aw, &ah, &af);
+        err = CFHD_PrepareToDecode(ref, w, h, format, CFHD_DECODED_RESOLUTION_FULL, CFHD_DECODING_FLAGS_NONE,
+                                   const_cast<uint8_t*>(first), first_size, &aw, &ah, &af);
         if (err != CFHD_ERROR_OKAY) return "CFHD_PrepareToDecode failed, code " + std::to_string(int(err));
         width = aw;
         height = ah;
@@ -71,10 +77,10 @@ struct CfhdDecoder {
         frame.resize(size_t(pitch) * size_t(height));
         return std::string();
     }
-    std::string decode(const AviMovie& m, size_t i)
+    std::string decode(const AviMovie& m, size_t i) { return decode(m.data(m.video[i]), m.video[i].size, i); }
+    std::string decode(const uint8_t* sample, uint32_t size, size_t i)
     {
-        const AviChunk& c = m.video[i];
-        const CFHD_Error err = CFHD_DecodeSample(ref, const_cast<uint8_t*>(m.data(c)), c.size, frame.data(), pitch);
+        const CFHD_Error err = CFHD_DecodeSample(ref, const_cast<uint8_t*>(sample), size, frame.data(), pitch);
         if (err != CFHD_ERROR_OKAY) return "CFHD_DecodeSample failed on frame " + std::to_string(i) + ", code " + std::to_string(int(err));
         return std::string();
     }
@@ -93,6 +99,73 @@ void flip_rows(const std::vector<uint8_t>& src, int32_t pitch, int height, std::
         std::memcpy(dst.data() + size_t(pitch) * y, src.data() + size_t(pitch) * (height - 1 - y), size_t(pitch));
 }
 
+bool ends_with(const std::string& s, const char* suffix)
+{
+    const size_t n = std::strlen(suffix);
+    return s.size() > n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+const char kCineFormCodecId[] = "V_MS/VFW/FOURCC";
+
+std::string cineform_format(const std::vector<uint8_t>& bih)
+{
+    if (bih.size() < 40 || avi_detail::u32(bih.data()) < 40) return "the video format is not a BITMAPINFOHEADER";
+    if (std::memcmp(bih.data() + 16, "CFHD", 4)) return "the BITMAPINFOHEADER's FOURCC is not CFHD";
+    return std::string();
+}
+
+int write_ppm(const CfhdDecoder& dec, const char* out, size_t index, size_t frames);
+
+int dump_mkv_frame(const char* in, size_t index, const char* out)
+{
+    MkvTracks t;
+    std::string e = t.open(in);
+    if (!e.empty()) return fail(e);
+    if (t.video_codec != kCineFormCodecId) return fail("the video track is " + t.video_codec + ", not " + kCineFormCodecId);
+    if (!(e = cineform_format(t.video_private)).empty()) return fail(e);
+    if (index >= t.video.size()) return fail("frame index out of range");
+    const int w = int(avi_detail::u32(t.video_private.data() + 4));
+    const int h = std::abs(int(avi_detail::u32(t.video_private.data() + 8)));
+    std::vector<uint8_t> first, sample;
+    if (!(e = t.read(t.video[0], first)).empty() || !(e = t.read(t.video[index], sample)).empty()) return fail(e);
+    CfhdDecoder dec;
+    if (!(e = dec.open(w, h, first.data(), uint32_t(first.size()))).empty()) return fail(e);
+    if (!(e = dec.decode(sample.data(), uint32_t(sample.size()), index)).empty()) return fail(e);
+    return write_ppm(dec, out, index, t.video.size());
+}
+
+int dump_frame(const char* in, size_t index, const char* out)
+{
+    if (ends_with(in, ".mkv")) return dump_mkv_frame(in, index, out);
+    AviMovie m;
+    std::string e = avi_read(in, m);
+    if (!e.empty()) return fail(e);
+    if (index >= m.video.size()) return fail("frame index out of range");
+    CfhdDecoder dec;
+    if (!(e = dec.open(m)).empty()) return fail(e);
+    if (!(e = dec.decode(m, index)).empty()) return fail(e);
+    return write_ppm(dec, out, index, m.video.size());
+}
+
+int write_ppm(const CfhdDecoder& dec, const char* out, size_t index, size_t frames)
+{
+    std::vector<uint8_t> top;
+    flip_rows(dec.frame, dec.pitch, dec.height, top);
+    std::FILE* f = std::fopen(out, "wb");
+    if (!f) return fail("cannot write ppm");
+    std::fprintf(f, "P6\n%d %d\n255\n", dec.width, dec.height);
+    for (int y = 0; y < dec.height; y++) {
+        const uint8_t* row = top.data() + size_t(dec.pitch) * y;
+        for (int x = 0; x < dec.width; x++) {
+            const uint8_t rgb[3] = {row[x * 4 + 2], row[x * 4 + 1], row[x * 4 + 0]};
+            std::fwrite(rgb, 1, 3, f);
+        }
+    }
+    std::fclose(f);
+    std::printf("wrote %s (%dx%d, frame %zu of %zu)\n", out, dec.width, dec.height, index, frames);
+    return 0;
+}
+
 // An XMP packet file for the segment's XMP SimpleTag: the whole <?xpacket begin ... end?> text.
 std::string read_xmp(const char* path, std::string& xmp)
 {
@@ -107,30 +180,195 @@ std::string read_xmp(const char* path, std::string& xmp)
     return std::string();
 }
 
-int dump_frame(const char* in, size_t index, const char* out)
+std::string open_segment(mkvmuxer::MkvWriter& writer, mkvmuxer::Segment& seg, const char* out, const AviMovie& m,
+                         const char* codec_id, uint64_t& vtrack, const std::string& xmp)
+{
+    if (!writer.Open(out)) return std::string("cannot open ") + out + " for writing";
+    if (!seg.Init(&writer)) return "mkvmuxer Segment::Init failed";
+    seg.set_mode(mkvmuxer::Segment::kFile);
+    seg.OutputCues(true);
+    seg.GetSegmentInfo()->set_writing_app("av1mkv (interactor-dress-on)");
+    seg.GetSegmentInfo()->set_muxing_app("libwebm mkvmuxer (V-Sekai-fire/libwebm)");
+    vtrack = seg.AddVideoTrack(int(m.width), int(m.height), 0);
+    if (!vtrack) return "AddVideoTrack failed";
+    mkvmuxer::VideoTrack* video = static_cast<mkvmuxer::VideoTrack*>(seg.GetTrackByNumber(vtrack));
+    video->set_codec_id(codec_id);
+    video->set_frame_rate(double(m.fps_num) / double(m.fps_den));
+    video->set_default_duration(uint64_t(1000000000ull * m.fps_den / m.fps_num));
+    seg.CuesTrack(vtrack);
+    // Tags go into the segment header, which the first AddFrame writes.
+    if (!xmp.empty()) {
+        mkvmuxer::Tag* tag = seg.AddTag();
+        if (!tag || !tag->add_simple_tag("XMP", xmp.c_str())) return "cannot add the XMP tag";
+        std::printf("xmp: %zu bytes as the segment's XMP SimpleTag\n", xmp.size());
+    }
+    return std::string();
+}
+
+std::vector<int16_t> pcm_of(const AviMovie& m)
+{
+    std::vector<int16_t> pcm;
+    for (const AviChunk& c : m.audio) {
+        const int16_t* p = reinterpret_cast<const int16_t*>(m.data(c));
+        pcm.insert(pcm.end(), p, p + c.size / 2);
+    }
+    return pcm;
+}
+
+// The PCM as FLAC, decoded back bit-exact before it is muxed. A .webm's FLAC makes libwebm write
+// the matroska doctype: WebM's spec names only Opus and Vorbis.
+std::string add_flac_track(mkvmuxer::Segment& seg, const AviMovie& m, FlacTrack& flac, uint64_t& atrack)
+{
+    atrack = 0;
+    if (!m.has_audio || m.audio.empty()) return std::string();
+    if (m.bits != 16) return "the recording's audio is not 16-bit PCM";
+    const std::vector<int16_t> pcm = pcm_of(m);
+    const uint64_t total = pcm.size() / m.channels;
+    std::string e = flac_encode(pcm.data(), total, m.channels, m.mix_rate, flac);
+    if (e.empty()) e = flac_verify(flac, pcm.data(), m.channels);
+    if (!e.empty()) return e;
+    size_t bytes = 0;
+    for (const std::vector<uint8_t>& f : flac.frames) bytes += f.size();
+    std::printf("flac: %llu samples x%u, %zu frames, %zu bytes (PCM %zu); libFLAC decodes it back bit-exact, MD5 checked\n",
+                (unsigned long long)total, m.channels, flac.frames.size(), bytes, pcm.size() * 2);
+    atrack = seg.AddAudioTrack(int(m.mix_rate), int(m.channels), 0);
+    if (!atrack) return "AddAudioTrack failed";
+    mkvmuxer::AudioTrack* audio = static_cast<mkvmuxer::AudioTrack*>(seg.GetTrackByNumber(atrack));
+    audio->set_codec_id("A_FLAC");
+    audio->set_bit_depth(16);
+    if (!audio->SetCodecPrivate(flac.codec_private.data(), flac.codec_private.size())) return "SetCodecPrivate (FLAC) failed";
+    return std::string();
+}
+
+// FLAC frames up to a video frame's time go first: mkvmuxer wants timestamps monotonic across tracks.
+struct AudioFeed {
+    mkvmuxer::Segment* seg = nullptr;
+    const FlacTrack* flac = nullptr;
+    uint64_t track = 0;
+    uint32_t rate = 0;
+    size_t next = 0;
+
+    std::string flush_to(uint64_t ts_ns)
+    {
+        while (track && next < flac->frames.size()) {
+            const uint64_t ts = flac->first_sample[next] * 1000000000ull / rate;
+            if (ts > ts_ns) break;
+            const std::vector<uint8_t>& f = flac->frames[next];
+            if (!seg->AddFrame(f.data(), f.size(), track, ts, true)) return "AddFrame (flac) failed";
+            next++;
+        }
+        return std::string();
+    }
+};
+
+long long file_size(const char* path)
+{
+    std::FILE* f = std::fopen(path, "rb");
+    long long n = 0;
+    if (f) { _fseeki64(f, 0, SEEK_END); n = _ftelli64(f); std::fclose(f); }
+    return n;
+}
+
+int check_cineform(const AviMovie& m, const char* mkv)
+{
+    MkvTracks t;
+    std::string e = t.open(mkv);
+    if (!e.empty()) return fail(e);
+    if (t.video_codec != kCineFormCodecId) return fail("the video track is " + t.video_codec + ", not " + kCineFormCodecId);
+    if (t.video_private != m.video_format) return fail("the CodecPrivate differs from the recording's BITMAPINFOHEADER");
+    if (t.video.size() != m.video.size())
+        return fail("the .mkv has " + std::to_string(t.video.size()) + " video frames, the .cfhd " + std::to_string(m.video.size()));
+    size_t same = 0, keys = 0;
+    std::vector<uint8_t> block;
+    for (size_t i = 0; i < t.video.size(); i++) {
+        if (!(e = t.read(t.video[i], block)).empty()) return fail(e);
+        const AviChunk& c = m.video[i];
+        if (block.size() == c.size && std::memcmp(block.data(), m.data(c), c.size) == 0) same++;
+        if (t.video[i].key) keys++;
+    }
+    std::printf("check: video %zu/%zu CFHD frames byte-identical to the .cfhd's, %zu key; CodecPrivate is the recording's %zu-byte "
+                "BITMAPINFOHEADER\n", same, m.video.size(), keys, m.video_format.size());
+    if (same != m.video.size()) return fail("a video frame differs from the .cfhd's");
+    if (keys != m.video.size()) return fail("a CineForm block is not marked key");
+
+    if (m.has_audio && !m.audio.empty()) {
+        if (t.audio_codec != "A_FLAC") return fail("the audio track is " + t.audio_codec + ", not A_FLAC");
+        const std::vector<int16_t> pcm = pcm_of(m);
+        FlacTrack flac;
+        flac.codec_private = t.audio_private;
+        flac.samples = pcm.size() / m.channels;
+        for (const MkvFrame& f : t.audio) {
+            flac.frames.emplace_back();
+            if (!(e = t.read(f, flac.frames.back())).empty()) return fail(e);
+        }
+        if (!(e = flac_verify(flac, pcm.data(), m.channels)).empty()) return fail("audio: " + e);
+        std::printf("check: audio %zu FLAC blocks decode to the .cfhd's %llu PCM samples x%u bit-exact, MD5 checked\n", t.audio.size(),
+                    (unsigned long long)flac.samples, m.channels);
+    }
+    const double want_s = double(m.video.size()) * double(m.fps_den) / double(m.fps_num);
+    std::printf("check: duration %.3f s (%zu frames at %u/%u fps is %.3f s)\n", double(t.duration_ns) / 1e9, m.video.size(), m.fps_num,
+                m.fps_den, want_s);
+    if (std::abs(double(t.duration_ns) / 1e9 - want_s) > 0.001) return fail("the duration is not the frame count's");
+    return 0;
+}
+
+std::string read_cineform(const char* in, AviMovie& m)
+{
+    std::string e = avi_read(in, m);
+    if (e.empty()) e = avi_complete(m);
+    if (e.empty() && std::strcmp(m.handler, "CFHD")) e = "the video handler is not CFHD";
+    if (e.empty()) e = cineform_format(m.video_format);
+    return e;
+}
+
+int mux_cineform(const char* in, const char* out, const std::string& xmp)
+{
+    if (!ends_with(out, ".mkv")) return fail("the output must be a .mkv (the CineForm frames unchanged, the audio as FLAC)");
+    const Clock::time_point t_all = Clock::now();
+    AviMovie m;
+    std::string e = read_cineform(in, m);
+    if (!e.empty()) return fail(e);
+    std::printf("input: %s, %zu bytes, %ux%u, %u/%u fps, %zu CFHD frames, %zu audio chunks\n", in, m.bytes.size(), m.width, m.height,
+                m.fps_num, m.fps_den, m.video.size(), m.audio.size());
+
+    mkvmuxer::MkvWriter writer;
+    mkvmuxer::Segment seg;
+    uint64_t vtrack = 0;
+    if (!(e = open_segment(writer, seg, out, m, kCineFormCodecId, vtrack, xmp)).empty()) return fail(e);
+    mkvmuxer::Track* video = seg.GetTrackByNumber(vtrack);
+    if (!video->SetCodecPrivate(m.video_format.data(), m.video_format.size())) return fail("SetCodecPrivate (BITMAPINFOHEADER) failed");
+    FlacTrack flac;
+    uint64_t atrack = 0;
+    if (!(e = add_flac_track(seg, m, flac, atrack)).empty()) return fail(e);
+    AudioFeed feed;
+    feed.seg = &seg;
+    feed.flac = &flac;
+    feed.track = atrack;
+    feed.rate = m.mix_rate;
+
+    const uint64_t frame_ns = 1000000000ull * m.fps_den / m.fps_num;
+    for (size_t i = 0; i < m.video.size(); i++) {
+        const uint64_t ts = uint64_t(i) * frame_ns;
+        if (!(e = feed.flush_to(ts)).empty()) return fail(e);
+        const AviChunk& c = m.video[i];
+        if (!seg.AddFrame(m.data(c), c.size, vtrack, ts, true)) return fail("AddFrame (video) failed on frame " + std::to_string(i));
+    }
+    if (!(e = feed.flush_to(~0ull)).empty()) return fail(e);
+    seg.set_duration(double(m.video.size() * frame_ns) / double(seg.GetSegmentInfo()->timecode_scale()));
+    if (!seg.Finalize()) return fail("mkvmuxer Finalize failed");
+    writer.Close();
+    const long long out_size = file_size(out);
+    std::printf("wrote %s: %lld bytes (%.2f%% of the input), %zu frames, %zu FLAC blocks, %.2f s wall\n", out, out_size,
+                100.0 * double(out_size) / double(m.bytes.size()), m.video.size(), feed.next, ms_since(t_all) / 1000.0);
+    return check_cineform(m, out);
+}
+
+int check(const char* in, const char* mkv)
 {
     AviMovie m;
-    std::string e = avi_read(in, m);
+    const std::string e = read_cineform(in, m);
     if (!e.empty()) return fail(e);
-    if (index >= m.video.size()) return fail("frame index out of range");
-    CfhdDecoder dec;
-    if (!(e = dec.open(m)).empty()) return fail(e);
-    if (!(e = dec.decode(m, index)).empty()) return fail(e);
-    std::vector<uint8_t> top;
-    flip_rows(dec.frame, dec.pitch, dec.height, top);
-    std::FILE* f = std::fopen(out, "wb");
-    if (!f) return fail("cannot write ppm");
-    std::fprintf(f, "P6\n%d %d\n255\n", dec.width, dec.height);
-    for (int y = 0; y < dec.height; y++) {
-        const uint8_t* row = top.data() + size_t(dec.pitch) * y;
-        for (int x = 0; x < dec.width; x++) {
-            const uint8_t rgb[3] = {row[x * 4 + 2], row[x * 4 + 1], row[x * 4 + 0]};
-            std::fwrite(rgb, 1, 3, f);
-        }
-    }
-    std::fclose(f);
-    std::printf("wrote %s (%dx%d, frame %zu of %zu)\n", out, dec.width, dec.height, index, m.video.size());
-    return 0;
+    return check_cineform(m, mkv);
 }
 
 int encode(int argc, char** argv)
@@ -153,8 +391,7 @@ int encode(int argc, char** argv)
         else return fail(std::string("unknown option ") + argv[i]);
     }
 
-    const std::string out_s(out);
-    if (out_s.size() <= 5 || out_s.compare(out_s.size() - 5, 5, ".webm") != 0)
+    if (!ends_with(out, ".webm"))
         return fail("the output must be a .webm (AV1 video, the audio as FLAC)");
 
     const auto t_all = Clock::now();
@@ -183,72 +420,26 @@ int encode(int argc, char** argv)
                 enc.adapter_description().c_str(), s.cq, s.gop);
 
     mkvmuxer::MkvWriter writer;
-    if (!writer.Open(out)) return fail(std::string("cannot open ") + out + " for writing");
     mkvmuxer::Segment seg;
-    if (!seg.Init(&writer)) return fail("mkvmuxer Segment::Init failed");
-    seg.set_mode(mkvmuxer::Segment::kFile);
-    seg.OutputCues(true);
-    seg.GetSegmentInfo()->set_writing_app("av1mkv (interactor-dress-on)");
-    seg.GetSegmentInfo()->set_muxing_app("libwebm mkvmuxer (V-Sekai-fire/libwebm)");
-    const uint64_t vtrack = seg.AddVideoTrack(int(m.width), int(m.height), 0);
-    if (!vtrack) return fail("AddVideoTrack failed");
-    auto* video = static_cast<mkvmuxer::VideoTrack*>(seg.GetTrackByNumber(vtrack));
-    video->set_codec_id(mkvmuxer::Tracks::kAv1CodecId);
-    video->set_frame_rate(double(m.fps_num) / double(m.fps_den));
-    // Default duration of one frame in ns, so a player knows the frame period.
-    video->set_default_duration(uint64_t(1000000000ull * m.fps_den / m.fps_num));
-    seg.CuesTrack(vtrack);
-    // Tags go into the segment header, which the first AddFrame writes.
-    if (!xmp.empty()) {
-        mkvmuxer::Tag* tag = seg.AddTag();
-        if (!tag || !tag->add_simple_tag("XMP", xmp.c_str())) return fail("cannot add the XMP tag");
-        std::printf("xmp: %zu bytes as the segment's XMP SimpleTag\n", xmp.size());
-    }
-    uint64_t atrack = 0;
-    // A .webm carries the PCM losslessly as FLAC (libFLAC). WebM's spec names only Opus and Vorbis,
-    // so libwebm writes the matroska doctype for it; browser players decode FLAC in Matroska.
+    uint64_t vtrack = 0;
+    if (!(e = open_segment(writer, seg, out, m, mkvmuxer::Tracks::kAv1CodecId, vtrack, xmp)).empty()) return fail(e);
+    mkvmuxer::Track* video = seg.GetTrackByNumber(vtrack);
     FlacTrack flac;
-    if (m.has_audio && !m.audio.empty() && m.bits != 16) return fail("the recording's audio is not 16-bit PCM");
-    if (m.has_audio && !m.audio.empty()) {
-        std::vector<int16_t> pcm;
-        for (const AviChunk& c : m.audio) {
-            const int16_t* p = reinterpret_cast<const int16_t*>(m.data(c));
-            pcm.insert(pcm.end(), p, p + c.size / 2);
-        }
-        const uint64_t total = pcm.size() / m.channels;
-        if (!(e = flac_encode(pcm.data(), total, m.channels, m.mix_rate, flac)).empty()) return fail(e);
-        if (!(e = flac_verify(flac, pcm.data(), m.channels)).empty()) return fail(e);
-        size_t bytes = 0;
-        for (const auto& f : flac.frames) bytes += f.size();
-        std::printf("flac: %llu samples x%u, %zu frames, %zu bytes (PCM %zu); libFLAC decodes it back bit-exact, MD5 checked\n",
-                    (unsigned long long)total, m.channels, flac.frames.size(), bytes, pcm.size() * 2);
-        atrack = seg.AddAudioTrack(int(m.mix_rate), int(m.channels), 0);
-        if (!atrack) return fail("AddAudioTrack failed");
-        auto* audio = static_cast<mkvmuxer::AudioTrack*>(seg.GetTrackByNumber(atrack));
-        audio->set_codec_id("A_FLAC");
-        audio->set_bit_depth(16);
-        if (!audio->SetCodecPrivate(flac.codec_private.data(), flac.codec_private.size())) return fail("SetCodecPrivate (FLAC) failed");
-    }
+    uint64_t atrack = 0;
+    if (!(e = add_flac_track(seg, m, flac, atrack)).empty()) return fail(e);
+    AudioFeed feed;
+    feed.seg = &seg;
+    feed.flac = &flac;
+    feed.track = atrack;
+    feed.rate = m.mix_rate;
 
     const uint64_t frame_ns = 1000000000ull * m.fps_den / m.fps_num;
     const size_t frames = max_frames ? std::min(max_frames, m.video.size()) : m.video.size();
-    size_t audio_next = 0;
     bool have_private = false;
     size_t packets = 0, keyframes = 0;
     uint64_t out_bytes = 0;
     std::string mux_error;
 
-    // Audio chunks up to the video frame's time go first: mkvmuxer wants the segment's
-    // timestamps monotonic across tracks.
-    auto flush_audio_to = [&](uint64_t ts_ns) {
-        while (atrack && audio_next < flac.frames.size()) {
-            const uint64_t ts = flac.first_sample[audio_next] * 1000000000ull / m.mix_rate;
-            if (ts > ts_ns) break;
-            const auto& f = flac.frames[audio_next];
-            if (!seg.AddFrame(f.data(), f.size(), atrack, ts, true)) { mux_error = "AddFrame (flac) failed"; return; }
-            audio_next++;
-        }
-    };
 
     auto sink = [&](const NvencPacket& pkt) {
         if (!mux_error.empty()) return;
@@ -274,7 +465,7 @@ int encode(int argc, char** argv)
         }
         if (!have_private) { mux_error = "the first packet has no sequence header"; return; }
         const uint64_t ts = pkt.pts * frame_ns;
-        flush_audio_to(ts);
+        mux_error = feed.flush_to(ts);
         if (!mux_error.empty()) return;
         if (!seg.AddFrame(block.data(), block.size(), vtrack, ts, pkt.keyframe)) { mux_error = "AddFrame (video) failed"; return; }
         packets++;
@@ -300,19 +491,16 @@ int encode(int argc, char** argv)
     if (!mux_error.empty()) return fail(mux_error);
     // Audio that lands after the last video frame's time (there is one chunk per frame, so
     // normally none is left).
-    flush_audio_to(~0ull);
-    if (!mux_error.empty()) return fail(mux_error);
+    if (!(e = feed.flush_to(~0ull)).empty()) return fail(e);
     const double loop_ms = ms_since(t_loop);
     const double dur_s = double(frames) * double(m.fps_den) / double(m.fps_num);
     if (!seg.Finalize()) return fail("mkvmuxer Finalize failed");
     writer.Close();
     const double all_ms = ms_since(t_all);
 
-    std::FILE* f = std::fopen(out, "rb");
-    long long out_size = 0;
-    if (f) { _fseeki64(f, 0, SEEK_END); out_size = _ftelli64(f); std::fclose(f); }
+    const long long out_size = file_size(out);
     std::printf("\nwrote %s: %lld bytes (%.1f%% of the input), %zu frames (%zu key), %zu audio chunks, %.2f s of video\n", out,
-                out_size, 100.0 * double(out_size) / double(m.bytes.size()), packets, keyframes, audio_next, dur_s);
+                out_size, 100.0 * double(out_size) / double(m.bytes.size()), packets, keyframes, feed.next, dur_s);
     std::printf("time: %.2f s total wall, %.2f s decode+encode loop = %.1f fps (%.1fx realtime); per frame: CFHD decode %.2f ms, "
                 "row flip %.2f ms, NVENC copy-in %.2f ms, submit %.2f ms, lock/readback %.2f ms\n",
                 all_ms / 1000.0, loop_ms / 1000.0, double(frames) * 1000.0 / loop_ms, dur_s * 1000.0 / loop_ms, decode_ms / double(frames),
@@ -326,10 +514,23 @@ int encode(int argc, char** argv)
 int main(int argc, char** argv)
 {
     if (argc >= 2 && !std::strcmp(argv[1], "encode")) return encode(argc, argv);
+    if (argc >= 4 && !std::strcmp(argv[1], "mkv")) {
+        std::string xmp;
+        for (int i = 4; i + 1 < argc; i += 2) {
+            if (!std::strcmp(argv[i], "--xmp")) {
+                const std::string e = read_xmp(argv[i + 1], xmp);
+                if (!e.empty()) return fail(e);
+            }
+            else return fail(std::string("unknown option ") + argv[i]);
+        }
+        return mux_cineform(argv[2], argv[3], xmp);
+    }
+    if (argc >= 4 && !std::strcmp(argv[1], "check")) return check(argv[2], argv[3]);
     if (argc >= 3 && !std::strcmp(argv[1], "info")) return mkv_info(argv[2]);
     if (argc >= 5 && !std::strcmp(argv[1], "dump-frame")) return dump_frame(argv[2], size_t(std::atoll(argv[3])), argv[4]);
     std::fprintf(stderr,
                  "usage:\n  av1mkv encode <in.cfhd> <out.webm> [--cq N] [--gop N] [--gpu NAME] [--frames N] [--xmp FILE]\n"
-                 "  av1mkv info <file.webm>\n  av1mkv dump-frame <in.cfhd> <index> <out.ppm>\n");
+                 "  av1mkv mkv <in.cfhd> <out.mkv> [--xmp FILE]\n  av1mkv check <in.cfhd> <in.mkv>\n  av1mkv info <file.webm|file.mkv>\n"
+                 "  av1mkv dump-frame <in.cfhd|in.mkv> <index> <out.ppm>\n");
     return 2;
 }

@@ -5,12 +5,15 @@
 // CodecPrivate, and per track the block count and key frame count. It is the FFmpeg-free
 // verification of the transcoder's output.
 
+#include "mkv_tracks.h"
+
 #include <mkvparser/mkvparser.h>
 #include <mkvparser/mkvreader.h>
 
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <string>
 
 int mkv_info(const char* path)
 {
@@ -23,6 +26,8 @@ int mkv_info(const char* path)
 
     mkvparser::Segment* segment = nullptr;
     if (mkvparser::Segment::CreateInstance(&reader, pos, segment) || !segment) { std::fprintf(stderr, "no segment\n"); return 1; }
+    const std::string cut = mkv_truncation(&reader, segment);
+    if (!cut.empty()) { std::fprintf(stderr, "%s\n", cut.c_str()); delete segment; return 1; }
     if (segment->Load() < 0) { std::fprintf(stderr, "segment load failed\n"); delete segment; return 1; }
 
     const mkvparser::SegmentInfo* info = segment->GetInfo();
@@ -52,6 +57,12 @@ int mkv_info(const char* path)
             std::printf(" [");
             for (size_t k = 0; k < priv_len && k < 4; k++) std::printf("%02x", priv[k]);
             std::printf("...]");
+        }
+        if (priv && priv_len >= 40 && !std::strcmp(t->GetCodecId() ? t->GetCodecId() : "", "V_MS/VFW/FOURCC")) {
+            const unsigned char* bih = priv;
+            std::printf(", BITMAPINFOHEADER FOURCC %.4s, %u-bit, %ux%u", reinterpret_cast<const char*>(bih + 16), unsigned(bih[14] | bih[15] << 8),
+                        unsigned(bih[4] | bih[5] << 8 | bih[6] << 16 | unsigned(bih[7]) << 24),
+                        unsigned(bih[8] | bih[9] << 8 | bih[10] << 16 | unsigned(bih[11]) << 24));
         }
         std::printf("\n");
     }
