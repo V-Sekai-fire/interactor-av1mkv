@@ -53,6 +53,7 @@ add_executable(av1mkv
   src/main.cpp
   src/flac_track.cpp
   src/mkv_info.cpp
+  src/mkv_tracks.cpp
   src/nvenc_av1.cpp)
 # V-Sekai-fire/nv-codec-headers: the copy tools/oxrsys carries (untracked there, fetched by
 # its build), else the one in the main checkout; NV_CODEC_HEADERS overrides.
