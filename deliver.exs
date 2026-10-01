@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: MIT
 #
-# A CineForm recording to its two deliverables: AV1 and FLAC in a .webm, and the CineForm
-# frames unchanged with FLAC in a .mkv, each with a .cff beside it, checked before either is
-# called done.
+# A CineForm recording to its deliverable: the CineForm frames unchanged with FLAC in a .mkv,
+# with a .cff beside it, checked before it is called done.
 #
-#   elixir deliver.exs <in.cfhd|in.png> <out-dir> --meta <meta.exs> [--short] [--av1mkv <exe>] [--gpu <name>]
+#   elixir deliver.exs <in.cfhd|in.png> <out-dir> --meta <meta.exs> [--short] [--av1mkv <exe>]
 #   elixir deliver.exs --self-test
 #
 # <meta.exs> evaluates to a keyword list of title, abstract, authors, date, keywords and
@@ -300,7 +299,7 @@ defmodule Deliver.Run do
   @moduledoc false
   import Deliver
 
-  def main(cfhd, dir, meta_path, exe, gpu, short?) do
+  def main(cfhd, dir, meta_path, exe, short?) do
     {meta, _} = Code.eval_file(meta_path)
 
     pre = [
@@ -325,7 +324,6 @@ defmodule Deliver.Run do
 
     File.mkdir_p!(dir)
     stem = Path.basename(cfhd, Path.extname(cfhd))
-    webm = Path.join(dir, stem <> ".webm")
     mkv = Path.join(dir, stem <> ".mkv")
 
     tmp =
@@ -350,14 +348,9 @@ defmodule Deliver.Run do
          fn -> refused(run(exe, ["check", cut, mkv])) end},
         {"control: a .cfhd cut to half is refused by the RIFF count",
          fn -> refused(frames(cut)) end},
-        {"av1mkv encode",
-         fn -> ok(run(exe, ["encode", cfhd, webm, "--xmp", xmp, "--gpu", gpu])) end},
         {".mkv video blocks equal the .cfhd's #{n} frames, XMP whole",
          fn -> same(exe, mkv, n) end},
-        {".webm video blocks equal the .cfhd's #{n} frames, XMP whole",
-         fn -> same(exe, webm, n) end},
-        {"the .mkv carries #{mark()}", fn -> marked(mkv) end},
-        {"the .webm carries #{mark()}", fn -> marked(webm) end}
+        {"the .mkv carries #{mark()}", fn -> marked(mkv) end}
       ]
 
       failed = Enum.count(steps, fn {what, step} -> elem(report(step.(), what), 0) != :ok end)
@@ -369,8 +362,7 @@ defmodule Deliver.Run do
 
       for {file, what} <- [
             {mkv,
-             "CineForm frames as recorded, byte for byte, with the audio as FLAC, in a Matroska file: #{n} frames."},
-            {webm, "AV1 from NVENC with the audio as FLAC, in a WebM: #{n} frames."}
+             "CineForm frames as recorded, byte for byte, with the audio as FLAC, in a Matroska file: #{n} frames."}
           ] do
         sum = sha256(file)
         File.write!(file <> ".cff", citation(meta, file, sum, what))
@@ -632,13 +624,21 @@ case System.argv() do
     System.halt(Deliver.SelfTest.run())
 
   [cfhd, dir | opts] ->
-    {o, _, _} =
+    {o, rest, bad} =
       OptionParser.parse(opts,
-        strict: [meta: :string, av1mkv: :string, gpu: :string, short: :boolean]
+        strict: [meta: :string, av1mkv: :string, short: :boolean]
       )
 
     here = Path.dirname(__ENV__.file)
     exe = o[:av1mkv] || Path.join([here, "build", "av1mkv.exe"])
+
+    unless bad == [] and rest == [] do
+      IO.puts(
+        "  FAIL precondition: unknown arguments #{inspect(Enum.map(bad, &elem(&1, 0)) ++ rest)}"
+      )
+
+      System.halt(1)
+    end
 
     unless o[:meta] do
       IO.puts("  FAIL precondition: --meta <meta.exs> names the recording")
@@ -647,7 +647,7 @@ case System.argv() do
 
     cond do
       String.downcase(Path.extname(cfhd)) != ".png" ->
-        Deliver.Run.main(cfhd, dir, o[:meta], exe, o[:gpu] || "RTX 4090", o[:short] == true)
+        Deliver.Run.main(cfhd, dir, o[:meta], exe, o[:short] == true)
 
       o[:short] ->
         IO.puts("  FAIL precondition: --short is for a recording, not a still")
@@ -659,7 +659,7 @@ case System.argv() do
 
   _ ->
     IO.puts(
-      "usage: elixir deliver.exs <in.cfhd|in.png> <out-dir> --meta <meta.exs> [--short] [--av1mkv <exe>] [--gpu <name>]"
+      "usage: elixir deliver.exs <in.cfhd|in.png> <out-dir> --meta <meta.exs> [--short] [--av1mkv <exe>]"
     )
 
     System.halt(1)
