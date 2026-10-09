@@ -1,0 +1,36 @@
+name: checks
+on:
+  push:
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  commits:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: fetch the workspace commit-style gate
+        run: curl -fsSL -o /tmp/check_commit_style.py https://raw.githubusercontent.com/V-Sekai-fire/manuals-weftspun/main/scripts/check_commit_style.py
+      - name: commit-style self-test (controls)
+        run: python /tmp/check_commit_style.py --self-test
+      - name: commit subjects against the base
+        if: github.event_name == 'pull_request'
+        run: python /tmp/check_commit_style.py --base origin/${{ github.base_ref }}
+  cineform-msvc:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      # C++20, as XR Pilot builds it: MSVC then enables /permissive-, which strict-string errors need.
+      - name: build the CineForm codec with MSVC
+        run: |
+          cmake -S thirdparty/cineform-sdk -B build -DBUILD_TOOLS=OFF -DCMAKE_CXX_STANDARD=20
+          cmake --build build --target CFHDCodecStatic --config Release --parallel 4
