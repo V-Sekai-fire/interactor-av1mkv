@@ -15,4 +15,4 @@ The engine's movie writer records `.cfhd` video with PCM audio in a RIFF contain
 
 ## Licence
 
-MIT, as the SPDX headers in the source state. Vendored projects under `thirdparty/` carry their own licences.
+MIT. See [LICENSE](LICENSE). Vendored projects under `thirdparty/` carry their own licences.
