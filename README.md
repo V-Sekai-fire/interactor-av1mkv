@@ -4,7 +4,7 @@ A Windows tool that rewraps `.cfhd` recordings into Matroska with FLAC audio, an
 
 ## What it is for
 
-The engine's movie writer records `.cfhd` video with PCM audio in a RIFF container. `av1mkv` copies those frames byte for byte into an `.mkv`, encodes the audio as FLAC, and reads the result back to check every frame and sample; it can also encode an AV1 `.webm` on the GPU. `deliver.exs` turns a recording into the `.mkv` and `.cff` that RFD 2294 says every video ships as.
+The engine's movie writer records `.cfhd` video with PCM audio in a RIFF container. `av1mkv` copies those frames byte for byte into an `.mkv`, encodes the audio as FLAC, and reads the result back to check every frame and sample; it can also encode an AV1 `.webm` on the GPU. `deliver.exs` turns a recording into the `.mkv` and `.cff` that RFD66606-2294 says every video ships as.
 
 ## Build and run
 
